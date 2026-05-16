@@ -1,6 +1,7 @@
 const express = require("express");
 const SpotifyWebApi = require("spotify-web-api-node");
-const playdl = require("play-dl");
+const ytdl = require("@distube/ytdl-core");
+const YoutubeSearch = require("youtube-sr").default;
 
 const app = express();
 app.use(express.json());
@@ -15,8 +16,6 @@ app.use((req, res, next) => {
 });
 
 // ─── SPOTIFY CLIENT ───────────────────────────────────────────────────────────
-// Uses Client Credentials flow (no user login needed).
-// Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in Vercel Environment Variables.
 const spotifyApi = new SpotifyWebApi({
   clientId: process.env.SPOTIFY_CLIENT_ID,
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
@@ -28,13 +27,11 @@ async function ensureSpotifyToken() {
   if (Date.now() < spotifyTokenExpiry) return;
   const data = await spotifyApi.clientCredentialsGrant();
   spotifyApi.setAccessToken(data.body.access_token);
-  // Token is valid for 3600s; refresh 60s early
   spotifyTokenExpiry = Date.now() + (data.body.expires_in - 60) * 1000;
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function parseSpotifyId(url, type) {
-  // Matches both https://open.spotify.com/track/ID and spotify:track:ID
   const re = new RegExp(`${type}\\/([A-Za-z0-9]+)|${type}:([A-Za-z0-9]+)`);
   const m = url.match(re);
   return m ? m[1] || m[2] : null;
@@ -55,8 +52,6 @@ function detectType(url) {
 }
 
 // ─── POST /api/info ───────────────────────────────────────────────────────────
-// Body: { url: "https://open.spotify.com/track/..." }
-// Returns: { type, title, artist, cover, duration, query }
 app.post("/api/info", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "Missing 'url' in request body." });
@@ -90,22 +85,10 @@ app.post("/api/info", async (req, res) => {
       const artist = body.owner.display_name;
       const cover = body.images[0]?.url || null;
       const trackCount = body.tracks.total;
-
-      // Return first track's query as a representative sample
       const firstTrack = body.tracks.items[0]?.track;
-      const query = firstTrack
-        ? `${firstTrack.name} ${firstTrack.artists[0]?.name}`
-        : title;
+      const query = firstTrack ? `${firstTrack.name} ${firstTrack.artists[0]?.name}` : title;
 
-      return res.json({
-        type: "playlist",
-        title,
-        artist,
-        cover,
-        duration: `${trackCount} tracks`,
-        query,
-        trackCount,
-      });
+      return res.json({ type: "playlist", title, artist, cover, duration: `${trackCount} tracks`, query, trackCount });
     }
 
     if (type === "album") {
@@ -120,16 +103,9 @@ app.post("/api/info", async (req, res) => {
       const firstTrack = body.tracks.items[0];
       const query = firstTrack ? `${firstTrack.name} ${artist}` : title;
 
-      return res.json({
-        type: "album",
-        title,
-        artist,
-        cover,
-        duration: `${trackCount} tracks`,
-        query,
-        trackCount,
-      });
+      return res.json({ type: "album", title, artist, cover, duration: `${trackCount} tracks`, query, trackCount });
     }
+
   } catch (err) {
     console.error("[/api/info] Error:", err.message);
     return res.status(500).json({ error: "Failed to fetch Spotify info.", detail: err.message });
@@ -137,39 +113,32 @@ app.post("/api/info", async (req, res) => {
 });
 
 // ─── POST /api/download ───────────────────────────────────────────────────────
-// Body: { query: "Song Name Artist", title: "Song Name" }
-// Returns: { success: true, url: "DIRECT_AUDIO_URL", title: "filename.mp3" }
-//
-// Strategy: Search YouTube with play-dl (pure JS, no binaries), pick the best
-// match, then resolve a streamable audio format URL and return it directly.
-// The FRONTEND is responsible for the actual download — we never pipe audio
-// through Vercel (avoids the 10-second timeout entirely).
 app.post("/api/download", async (req, res) => {
   const { query, title } = req.body;
   if (!query) return res.status(400).json({ error: "Missing 'query' in request body." });
 
   try {
-    // 1. Search YouTube for the best matching video
-    const searchResults = await playdl.search(query, { source: { youtube: "video" }, limit: 5 });
+    // 1. Search YouTube
+    const results = await YoutubeSearch.search(query, { limit: 5, type: "video" });
 
-    if (!searchResults || searchResults.length === 0) {
-      return res.status(404).json({ error: "No YouTube results found for the query." });
+    if (!results || results.length === 0) {
+      return res.status(404).json({ error: "No YouTube results found." });
     }
 
-    // Pick the result whose duration is closest to a typical song (< 10 min)
-    const video =
-      searchResults.find((v) => v.durationInSec > 0 && v.durationInSec < 600) ||
-      searchResults[0];
+    // Pick best result under 10 minutes
+    const video = results.find((v) => v.duration > 0 && v.duration < 600000) || results[0];
+    const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
 
-    // 2. Get stream info — play-dl resolves direct YouTube audio format URLs
-    const streamInfo = await playdl.stream(video.url, { quality: 2 }); // quality 2 = best audio
+    // 2. Get audio format info using ytdl-core (no download, just URL)
+    const info = await ytdl.getInfo(videoUrl);
+    const formats = ytdl.filterFormats(info.formats, "audioonly");
 
-    // streamInfo.url is the direct CDN audio URL (no binary needed)
-    const directUrl = streamInfo.url;
-
-    if (!directUrl) {
-      return res.status(500).json({ error: "Could not resolve a direct audio URL." });
+    if (!formats || formats.length === 0) {
+      return res.status(500).json({ error: "No audio formats found." });
     }
+
+    // Pick best quality audio format
+    const best = formats.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
 
     const safeTitle = (title || video.title || "download")
       .replace(/[^\w\s-]/g, "")
@@ -178,11 +147,11 @@ app.post("/api/download", async (req, res) => {
 
     return res.json({
       success: true,
-      url: directUrl,
+      url: best.url,
       title: `${safeTitle}.mp3`,
       youtubeTitle: video.title,
-      youtubeDuration: video.durationRaw,
     });
+
   } catch (err) {
     console.error("[/api/download] Error:", err.message);
     return res.status(500).json({ error: "Failed to resolve audio URL.", detail: err.message });
