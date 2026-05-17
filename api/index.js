@@ -1,7 +1,5 @@
 const express = require("express");
 const SpotifyWebApi = require("spotify-web-api-node");
-const ytdl = require("@distube/ytdl-core");
-const YoutubeSearch = require("youtube-sr").default;
 
 const app = express();
 app.use(express.json());
@@ -15,12 +13,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── SPOTIFY CLIENT ───────────────────────────────────────────────────────────
+// ─── SPOTIFY ──────────────────────────────────────────────────────────────────
 const spotifyApi = new SpotifyWebApi({
   clientId: process.env.SPOTIFY_CLIENT_ID,
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
 });
-
 let spotifyTokenExpiry = 0;
 
 async function ensureSpotifyToken() {
@@ -31,18 +28,7 @@ async function ensureSpotifyToken() {
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
-function parseSpotifyId(url, type) {
-  const re = new RegExp(`${type}\\/([A-Za-z0-9]+)|${type}:([A-Za-z0-9]+)`);
-  const m = url.match(re);
-  return m ? m[1] || m[2] : null;
-}
-
-function formatDuration(ms) {
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = String(totalSec % 60).padStart(2, "0");
-  return `${m}:${s}`;
-}
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 
 function detectType(url) {
   if (url.includes("/track/") || url.includes("track:")) return "track";
@@ -51,115 +37,210 @@ function detectType(url) {
   return null;
 }
 
+function parseSpotifyId(url, type) {
+  const re = new RegExp(`${type}\\/([A-Za-z0-9]+)|${type}:([A-Za-z0-9]+)`);
+  const m = url.match(re);
+  return m ? m[1] || m[2] : null;
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// ─── YOUTUBE SEARCH (no key needed) ──────────────────────────────────────────
+async function searchYouTube(query) {
+  const encoded = encodeURIComponent(query);
+  const url = `https://www.youtube.com/results?search_query=${encoded}`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+  });
+  const html = await res.text();
+  // Extract video IDs from YouTube search results page
+  const matches = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/g);
+  if (!matches || matches.length === 0) throw new Error("No YouTube results found");
+  const videoId = matches[0].replace('"videoId":"', "").replace('"', "");
+  return videoId;
+}
+
+// ─── RAPIDAPI: Try multiple endpoints until one works ────────────────────────
+async function getAudioUrlViaRapidAPI(videoId) {
+  const endpoints = [
+    {
+      host: "youtube-mp36.p.rapidapi.com",
+      url: `https://youtube-mp36.p.rapidapi.com/dl?id=${videoId}`,
+      method: "GET",
+      extract: (d) => d.link || d.url,
+    },
+    {
+      host: "youtube-to-mp315.p.rapidapi.com",
+      url: `https://youtube-to-mp315.p.rapidapi.com/dl?id=${videoId}`,
+      method: "GET",
+      extract: (d) => d.link || d.url,
+    },
+    {
+      host: "yt-api.p.rapidapi.com",
+      url: `https://yt-api.p.rapidapi.com/dl?id=${videoId}`,
+      method: "GET",
+      extract: (d) => d.url || (d.formats && d.formats[0] && d.formats[0].url),
+    },
+    {
+      host: "youtube-mp3-downloader2.p.rapidapi.com",
+      url: `https://youtube-mp3-downloader2.p.rapidapi.com/ytmp3/ytmp3/?url=https://www.youtube.com/watch?v=${videoId}`,
+      method: "GET",
+      extract: (d) => d.dlink || d.link || d.url,
+    },
+    {
+      host: "youtube-to-mp3-downloader.p.rapidapi.com",
+      url: `https://youtube-to-mp3-downloader.p.rapidapi.com/ytmp3/ytmp3/?url=https://www.youtube.com/watch?v=${videoId}`,
+      method: "GET",
+      extract: (d) => d.dlink || d.link || d.url,
+    },
+  ];
+
+  let lastError = null;
+
+  for (const ep of endpoints) {
+    try {
+      const res = await fetch(ep.url, {
+        method: ep.method,
+        headers: {
+          "x-rapidapi-key": RAPIDAPI_KEY,
+          "x-rapidapi-host": ep.host,
+        },
+      });
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      const audioUrl = ep.extract(data);
+
+      if (audioUrl && audioUrl.startsWith("http")) {
+        console.log(`[download] Success via ${ep.host}`);
+        return audioUrl;
+      }
+
+      // Some APIs return status "ok" with a link after processing
+      if (data.status === "ok" || data.status === "processing") {
+        // Poll once after 2 seconds
+        await new Promise((r) => setTimeout(r, 2000));
+        const res2 = await fetch(ep.url, {
+          method: ep.method,
+          headers: {
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": ep.host,
+          },
+        });
+        if (res2.ok) {
+          const data2 = await res2.json();
+          const audioUrl2 = ep.extract(data2);
+          if (audioUrl2 && audioUrl2.startsWith("http")) {
+            console.log(`[download] Success (after poll) via ${ep.host}`);
+            return audioUrl2;
+          }
+        }
+      }
+    } catch (err) {
+      lastError = err;
+      console.error(`[download] ${ep.host} failed:`, err.message);
+    }
+  }
+
+  throw new Error(lastError?.message || "All RapidAPI endpoints failed");
+}
+
 // ─── POST /api/info ───────────────────────────────────────────────────────────
 app.post("/api/info", async (req, res) => {
   const { url } = req.body;
-  if (!url) return res.status(400).json({ error: "Missing 'url' in request body." });
+  if (!url) return res.status(400).json({ error: "Missing url" });
 
   const type = detectType(url);
-  if (!type) return res.status(400).json({ error: "URL must be a Spotify track, album, or playlist link." });
+  if (!type) return res.status(400).json({ error: "Not a valid Spotify link" });
 
   try {
     await ensureSpotifyToken();
 
     if (type === "track") {
       const id = parseSpotifyId(url, "track");
-      if (!id) return res.status(400).json({ error: "Could not parse Spotify track ID." });
-
       const { body } = await spotifyApi.getTrack(id);
-      const title = body.name;
-      const artist = body.artists.map((a) => a.name).join(", ");
-      const cover = body.album.images[0]?.url || null;
-      const duration = formatDuration(body.duration_ms);
-      const query = `${title} ${artist}`;
-
-      return res.json({ type: "track", title, artist, cover, duration, query });
+      return res.json({
+        type: "track",
+        title: body.name,
+        artist: body.artists.map((a) => a.name).join(", "),
+        cover: body.album.images[0]?.url || null,
+        duration: formatDuration(body.duration_ms),
+        query: `${body.name} ${body.artists[0].name}`,
+      });
     }
 
     if (type === "playlist") {
       const id = parseSpotifyId(url, "playlist");
-      if (!id) return res.status(400).json({ error: "Could not parse Spotify playlist ID." });
-
       const { body } = await spotifyApi.getPlaylist(id);
-      const title = body.name;
-      const artist = body.owner.display_name;
-      const cover = body.images[0]?.url || null;
-      const trackCount = body.tracks.total;
-      const firstTrack = body.tracks.items[0]?.track;
-      const query = firstTrack ? `${firstTrack.name} ${firstTrack.artists[0]?.name}` : title;
-
-      return res.json({ type: "playlist", title, artist, cover, duration: `${trackCount} tracks`, query, trackCount });
+      const first = body.tracks.items[0]?.track;
+      return res.json({
+        type: "playlist",
+        title: body.name,
+        artist: body.owner.display_name,
+        cover: body.images[0]?.url || null,
+        duration: `${body.tracks.total} tracks`,
+        query: first ? `${first.name} ${first.artists[0]?.name}` : body.name,
+        trackCount: body.tracks.total,
+      });
     }
 
     if (type === "album") {
       const id = parseSpotifyId(url, "album");
-      if (!id) return res.status(400).json({ error: "Could not parse Spotify album ID." });
-
       const { body } = await spotifyApi.getAlbum(id);
-      const title = body.name;
       const artist = body.artists.map((a) => a.name).join(", ");
-      const cover = body.images[0]?.url || null;
-      const trackCount = body.tracks.total;
-      const firstTrack = body.tracks.items[0];
-      const query = firstTrack ? `${firstTrack.name} ${artist}` : title;
-
-      return res.json({ type: "album", title, artist, cover, duration: `${trackCount} tracks`, query, trackCount });
+      const first = body.tracks.items[0];
+      return res.json({
+        type: "album",
+        title: body.name,
+        artist,
+        cover: body.images[0]?.url || null,
+        duration: `${body.tracks.total} tracks`,
+        query: first ? `${first.name} ${artist}` : body.name,
+        trackCount: body.tracks.total,
+      });
     }
-
   } catch (err) {
-    console.error("[/api/info] Error:", err.message);
-    return res.status(500).json({ error: "Failed to fetch Spotify info.", detail: err.message });
+    console.error("[/api/info]", err.message);
+    return res.status(500).json({ error: "Failed to fetch Spotify info", detail: err.message });
   }
 });
 
 // ─── POST /api/download ───────────────────────────────────────────────────────
 app.post("/api/download", async (req, res) => {
   const { query, title } = req.body;
-  if (!query) return res.status(400).json({ error: "Missing 'query' in request body." });
+  if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    // 1. Search YouTube
-    const results = await YoutubeSearch.search(query, { limit: 5, type: "video" });
+    // 1. Find YouTube video ID
+    const videoId = await searchYouTube(query);
+    console.log(`[download] Found videoId: ${videoId} for query: ${query}`);
 
-    if (!results || results.length === 0) {
-      return res.status(404).json({ error: "No YouTube results found." });
-    }
+    // 2. Get direct MP3 URL via RapidAPI
+    const audioUrl = await getAudioUrlViaRapidAPI(videoId);
 
-    // Pick best result under 10 minutes
-    const video = results.find((v) => v.duration > 0 && v.duration < 600000) || results[0];
-    const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
-
-    // 2. Get audio format info using ytdl-core (no download, just URL)
-    const info = await ytdl.getInfo(videoUrl);
-    const formats = ytdl.filterFormats(info.formats, "audioonly");
-
-    if (!formats || formats.length === 0) {
-      return res.status(500).json({ error: "No audio formats found." });
-    }
-
-    // Pick best quality audio format
-    const best = formats.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
-
-    const safeTitle = (title || video.title || "download")
+    const safeTitle = (title || query)
       .replace(/[^\w\s-]/g, "")
       .trim()
-      .replace(/\s+/g, "_");
+      .replace(/\s+/g, "_")
+      .slice(0, 80);
 
     return res.json({
       success: true,
-      url: best.url,
+      url: audioUrl,
       title: `${safeTitle}.mp3`,
-      youtubeTitle: video.title,
     });
-
   } catch (err) {
-    console.error("[/api/download] Error:", err.message);
-    return res.status(500).json({ error: "Failed to resolve audio URL.", detail: err.message });
+    console.error("[/api/download]", err.message);
+    return res.status(500).json({ error: "Failed to resolve audio URL", detail: err.message });
   }
 });
 
-// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
-app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+// ─── HEALTH ───────────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) =>
+  res.json({ status: "ok", hasSpotify: !!process.env.SPOTIFY_CLIENT_ID, hasRapidApi: !!process.env.RAPIDAPI_KEY })
+);
 
-// ─── EXPORT FOR VERCEL ────────────────────────────────────────────────────────
 module.exports = app;
